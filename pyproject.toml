@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magnetron-serve"
+version = "0.1.0"
+description = "CLI and SSE inference server for Magnetron models: install, run and serve .mag snapshots."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "huggingface-hub>=1.20.1",
+    "magnetron-models>=0.1.0",
+    "rich>=15.0.0",
+]
+
+[tool.uv.sources]
+magnetron-models = { git = "https://github.com/MarioSieg/magnetron-models" }
+
+[project.scripts]
+magnetron-serve = "magnetron_serve.cli:main"
+mag = "magnetron_serve.cli:main"
+
+[tool.setuptools]
+packages = { find = { include = ["magnetron_serve*"] } }
+
+[tool.ruff]
+line-length = 150
+exclude = [
+    ".venv",
+    "docs",
+    "extern",
+    "test",
+    "tests",
+    "tools",
+    "fuzzer",
+    "cmake",
+    "bin",
+]
+
+[tool.ruff.lint]
+ignore = ["F403"]
+select = [
+    "ANN",
+    "UP",
+]
+
+[tool.ruff.format]
+quote-style = "single"
