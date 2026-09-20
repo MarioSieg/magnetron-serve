@@ -7,19 +7,6 @@
 # | License : https://www.apache.org/licenses/LICENSE-2.0               |
 # +---------------------------------------------------------------------+
 
-"""Loading models once, and running every generation on the thread that owns them.
-
-Magnetron binds its context to the first thread that uses it and refuses tensor work from any other,
-so a threaded server cannot generate inside its request handlers. The pool therefore owns one
-inference thread: it creates the context, loads the models, and runs every generation, while request
-handlers only hand it jobs and read chunks back off a queue.
-
-That single thread is also the whole scheduler. Jobs are served in arrival order, each holds the
-device for the length of its stream, and a model is only ever swapped between jobs, so nothing is
-evicted out from under a running generation. Interleaving would buy nothing anyway: generation
-saturates the device, so sharing it would only trade throughput for latency.
-"""
-
 from __future__ import annotations
 
 import gc
@@ -38,18 +25,16 @@ from magnetron_models.models import ModelBase
 from magnetron_serve import registry
 from magnetron_serve.registry import Target
 
-_CHUNK_BUFFER = 256  # Chunks the worker may run ahead of a slow client before it has to wait for one.
-_CANCEL_POLL = 0.1  # How long a blocked worker waits before re-checking whether its client is still there.
+_CHUNK_BUFFER = 256
+_CANCEL_POLL = 0.1
 
 
 class PoolBusy(Exception):
-    """More work is already queued than the pool is willing to hold."""
+    pass
 
 
 @dataclass(frozen=True, slots=True)
 class EngineDefaults:
-    """Sampling and placement a request inherits when it does not say otherwise."""
-
     device: str = AUTO_DVC
     dtype: str = 'bfloat16'
     seed: int = 3407
@@ -133,6 +118,71 @@ class Generation:
         self.cancelled.set()
 
 
+_ADMIT_POLL = 0.05
+_ADMIT_TIMEOUT = 30.0
+_STOP_TIMEOUT = 30.0
+
+
+class _ModelWorker:
+    def __init__(self, target: Target, defaults: EngineDefaults) -> None:
+        self.target = target
+        self.defaults = defaults
+        self.name: str = target.name
+        self.model: LoadedModel | None = None
+        self.jobs: queue.Queue[Generation | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name=f'magnetron-gen-{target.name}', daemon=True)
+
+    @property
+    def idle(self) -> bool:
+        return self.jobs.unfinished_tasks == 0
+
+    @property
+    def waiting(self) -> int:
+        return self.jobs.qsize()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, job: Generation) -> None:
+        self.jobs.put(job)
+
+    def stop(self, timeout: float = _STOP_TIMEOUT) -> None:
+        self.jobs.put(None)
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while True:
+            job = self.jobs.get()
+            try:
+                if job is None:
+                    return
+                self._execute(job)
+            finally:
+                self.jobs.task_done()
+
+    def _execute(self, job: Generation) -> None:
+        try:
+            model = self._ensure_loaded()
+            if not job.emit('ready', model.name):
+                return
+            if job.build_prompt is None:
+                job.emit('done')
+                return
+            model.requests += 1
+            for chunk in model.engine.gen_stream(job.build_prompt(model.engine.model), reset_cache=True, **job.sampling):
+                if not job.emit('chunk', chunk):
+                    return
+            job.emit('done')
+        except Exception as e:
+            job.emit('error', e)
+
+    def _ensure_loaded(self) -> LoadedModel:
+        if self.model is None:
+            engine, snapshot = build_engine(self.target, self.defaults)
+            self.model = LoadedModel(name=self.target.name, engine=engine, snapshot=snapshot)
+        return self.model
+
+
 class ModelPool:
     def __init__(
         self,
@@ -147,20 +197,18 @@ class ModelPool:
         self.default_model = default_model
         self.max_loaded = max_loaded
         self.queue_limit = queue_limit
-        self._jobs: queue.Queue[Generation | None] = queue.Queue()
-        self._loaded: OrderedDict[str, LoadedModel] = OrderedDict()
+        self._workers: OrderedDict[str, _ModelWorker] = OrderedDict()
         self._lock = threading.Lock()
-        self._worker = threading.Thread(target=self._run, name='magnetron-inference', daemon=True)
-        self._worker.start()
 
     @property
     def loaded(self) -> list[LoadedModel]:
         with self._lock:
-            return list(self._loaded.values())
+            return [w.model for w in self._workers.values() if w.model is not None]
 
     @property
     def waiting(self) -> int:
-        return self._jobs.qsize()
+        with self._lock:
+            return sum(w.waiting for w in self._workers.values())
 
     def resolve(self, name: str | None) -> Target:
         chosen: str | None = name or self.default_model
@@ -176,8 +224,9 @@ class ModelPool:
         temp: float | None = None,
         top_k: int | None = None,
     ) -> Generation:
-        if self._jobs.qsize() >= self.queue_limit:
-            raise PoolBusy(f'{self._jobs.qsize()} requests already queued')
+        queued = self.waiting
+        if queued >= self.queue_limit:
+            raise PoolBusy(f'{queued} requests already queued')
         return self._enqueue(Generation(self.resolve(name), build_prompt, {'max_tokens': max_tokens, 'temp': temp, 'top_k': top_k}))
 
     def preload(self, name: str | None = None) -> str:
@@ -188,48 +237,37 @@ class ModelPool:
             job.close()
 
     def _enqueue(self, job: Generation) -> Generation:
-        self._jobs.put(job)
-        return job
+        deadline = time.monotonic() + _ADMIT_TIMEOUT
+        while True:
+            retired: list[_ModelWorker] = []
+            with self._lock:
+                worker = self._workers.get(job.target.name)
+                if worker is None:
+                    while len(self._workers) >= self.max_loaded:
+                        victim = next((n for n, w in self._workers.items() if w.idle), None)
+                        if victim is None:
+                            break
+                        retired.append(self._workers.pop(victim))
+                    if len(self._workers) < self.max_loaded:
+                        worker = _ModelWorker(job.target, self.defaults)
+                        self._workers[job.target.name] = worker
+                        worker.start()
+                if worker is not None:
+                    self._workers.move_to_end(job.target.name)
+                    worker.submit(job)
+            for dead in retired:
+                dead.stop()
+            if retired:
+                gc.collect()
+            if worker is not None:
+                return job
+            if time.monotonic() >= deadline:
+                raise PoolBusy(f'all {self.max_loaded} model slots are busy')
+            time.sleep(_ADMIT_POLL)
 
     def shutdown(self) -> None:
-        self._jobs.put(None)
-        self._worker.join(timeout=5.0)
-
-    def _run(self) -> None:
-        while True:
-            job = self._jobs.get()
-            if job is None:
-                return
-            self._execute(job)
-
-    def _execute(self, job: Generation) -> None:
-        try:
-            model = self._load(job.target)
-            if not job.emit('ready', model.name):
-                return
-            if job.build_prompt is None:
-                job.emit('done')
-                return
-            model.requests += 1
-            for chunk in model.engine.gen_stream(job.build_prompt(model.engine.model), reset_cache=True, **job.sampling):
-                if not job.emit('chunk', chunk):
-                    return
-            job.emit('done')
-        except Exception as e:
-            job.emit('error', e)
-
-    def _load(self, target: Target) -> LoadedModel:
         with self._lock:
-            held = self._loaded.get(target.name)
-            if held is not None:
-                self._loaded.move_to_end(target.name)
-                return held
-            while len(self._loaded) >= self.max_loaded:
-                evicted = self._loaded.popitem(last=False)[1]
-                del evicted
-                gc.collect()
-        engine, snapshot = build_engine(target, self.defaults)
-        model = LoadedModel(name=target.name, engine=engine, snapshot=snapshot)
-        with self._lock:
-            self._loaded[target.name] = model
-        return model
+            workers = list(self._workers.values())
+            self._workers.clear()
+        for worker in workers:
+            worker.stop()
