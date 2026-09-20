@@ -51,7 +51,7 @@ def _add_engine_args(parser: argparse.ArgumentParser) -> None:
         help='Picks between several snapshots in one repo; a snapshot always runs in the dtype it was written in',
     )
     parser.add_argument('--max-tokens', type=int, default=_DEFAULTS.max_tokens, help='Maximum number of new tokens to generate')
-    parser.add_argument('--temp', type=float, default=_DEFAULTS.temp, help='Sampling temperature')
+    parser.add_argument('--temp', type=float, default=_DEFAULTS.temp, help='Sampling temperature; 0 is greedy, above it samples the top-k')
     parser.add_argument('--top-k', type=int, default=_DEFAULTS.top_k, help='Top-k sampling')
     parser.add_argument('--seed', type=int, default=_DEFAULTS.seed, help='Random seed for reproducibility')
     parser.add_argument('--system', type=str, default=_DEFAULTS.system, help='System prompt')

@@ -92,7 +92,7 @@ def repl(engine: InferenceEngine, title: str, system: str) -> None:
             prompt: str = (
                 conversation.build_initial_prompt(system) + conversation.build_user_turn(user)
                 if is_first_turn
-                else conversation.build_user_turn(user)
+                else conversation.build_assistant_end() + conversation.build_user_turn(user)
             )
             for chunk in engine.gen_stream(prompt, reset_cache=is_first_turn):
                 parts.append(chunk)
