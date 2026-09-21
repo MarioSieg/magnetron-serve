@@ -9,27 +9,33 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
+import os
 import sys
+import tempfile
 import time
 import uuid
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from magnetron_models.models import MODELS_MAP, ModelBase
+from magnetron import Tensor
+from magnetron_models.diffusion import ImageGenEngine
+from magnetron_models.models import DIFFUSION_MODELS_MAP, MODELS_MAP
 from rich.console import Console
 
 from magnetron_serve import registry
-from magnetron_serve.pool import Generation, ModelPool, PoolBusy
+from magnetron_serve.pool import ImageGeneration, ImageRequest, Job, ModelPool, PoolBusy, TextGeneration, WrongModelKind
 
 console = Console()
 
 _MAX_BODY = 32 * 1024 * 1024
+_MAX_IMAGES = 8
+_IMAGE_FORMATS: dict[str, str] = {'png': '.png', 'jpeg': '.jpg', 'jpg': '.jpg'}
 
 
 class RequestError(Exception):
@@ -82,6 +88,51 @@ def _messages_to_turns(messages: object, default_system: str) -> tuple[str, list
     if not turns:
         raise RequestError(HTTPStatus.BAD_REQUEST, 'messages holds no user turn')
     return '\n\n'.join(system_parts) if system_parts else default_system, turns
+
+
+def _image_request(payload: dict[str, Any]) -> ImageRequest:
+    width = _as_int(payload, 'width')
+    height = _as_int(payload, 'height')
+    size = payload.get('size')
+    if size is not None and (width is None or height is None):
+        try:
+            w, h = (int(part) for part in str(size).lower().split('x', 1))
+        except ValueError as e:
+            raise RequestError(HTTPStatus.BAD_REQUEST, 'size must look like 1024x1024') from e
+        width, height = width if width is not None else w, height if height is not None else h
+    count = _as_int(payload, 'n') or 1
+    if not 1 <= count <= _MAX_IMAGES:
+        raise RequestError(HTTPStatus.BAD_REQUEST, f'n must be between 1 and {_MAX_IMAGES}')
+    negative = payload.get('negative_prompt')
+    if negative is not None and not isinstance(negative, str):
+        raise RequestError(HTTPStatus.BAD_REQUEST, 'negative_prompt must be a string')
+    return ImageRequest(
+        height=height,
+        width=width,
+        steps=_as_int(payload, 'steps', 'num_inference_steps'),
+        seed=_as_int(payload, 'seed'),
+        negative_prompt=negative,
+        guidance_scale=_as_float(payload, 'guidance_scale'),
+        count=count,
+    )
+
+
+def _image_format(payload: dict[str, Any]) -> str:
+    if payload.get('response_format', 'b64_json') != 'b64_json':
+        raise RequestError(HTTPStatus.BAD_REQUEST, 'only response_format "b64_json" is supported, this server hosts no files')
+    fmt = str(payload.get('output_format', 'png')).lower()
+    if fmt not in _IMAGE_FORMATS:
+        raise RequestError(HTTPStatus.BAD_REQUEST, f'output_format must be one of {", ".join(sorted(_IMAGE_FORMATS))}')
+    return fmt
+
+
+def encode_image(pixels: Tensor, fmt: str) -> bytes:
+    """The image encoder writes files only, so go through one. .jpg drops the alpha the model paints."""
+    with tempfile.TemporaryDirectory(prefix='magnetron-serve-') as tmp:
+        path = os.path.join(tmp, f'image{_IMAGE_FORMATS[fmt]}')
+        ImageGenEngine.save(pixels, path)
+        with open(path, 'rb') as f:
+            return f.read()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -186,7 +237,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         routes = {
             '/v1/chat/completions': self._post_chat,
+            '/v1/images/generations': self._post_images,
             '/api/generate': self._post_generate,
+            '/api/images': self._post_images,
         }
         self._dispatch(routes)
 
@@ -202,6 +255,9 @@ class _Handler(BaseHTTPRequestHandler):
         except RequestError as e:
             with contextlib.suppress(ClientGone, BrokenPipeError, ConnectionResetError):
                 self._send_error(e.status, e.message)
+        except WrongModelKind as e:
+            with contextlib.suppress(ClientGone, BrokenPipeError, ConnectionResetError):
+                self._send_error(HTTPStatus.BAD_REQUEST, str(e))
         except ClientGone:
             pass
         except BrokenPipeError, ConnectionResetError:
@@ -218,7 +274,14 @@ class _Handler(BaseHTTPRequestHandler):
                 'default_model': self.pool.default_model,
                 'queued': self.pool.waiting,
                 'loaded': [
-                    {'name': m.name, 'device': m.engine.device, 'snapshot': m.snapshot, 'loaded_at': m.loaded_at, 'requests': m.requests}
+                    {
+                        'name': m.name,
+                        'kind': m.kind,
+                        'device': m.engine.device,
+                        'snapshot': m.snapshot,
+                        'loaded_at': m.loaded_at,
+                        'requests': m.requests,
+                    }
                     for m in self.pool.loaded
                 ],
             }
@@ -226,32 +289,35 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _get_models(self) -> None:
         installed = {s.repo_id for s in registry.cached_snapshots()}
+        specs = [(name, registry.CHAT, spec) for name, spec in MODELS_MAP.items()]
+        specs += [(name, registry.IMAGE, spec) for name, spec in DIFFUSION_MODELS_MAP.items()]
         data = [
             {
                 'id': name,
                 'object': 'model',
                 'owned_by': 'magnetron',
+                'kind': kind,
                 'installed': spec.snapshot_repo_id in installed,
                 'repo': spec.snapshot_repo_id,
             }
-            for name, spec in sorted(MODELS_MAP.items())
+            for name, kind, spec in sorted(specs)
         ]
         self._send_json({'object': 'list', 'data': data})
 
-    def _submit(
-        self,
-        model: str | None,
-        build_prompt: Callable[[ModelBase], str],
-        max_tokens: int | None,
-        temp: float | None,
-        top_k: int | None,
-    ) -> Generation:
+    def _target(self, model: str | None) -> registry.Target:
         try:
-            return self.pool.submit(model, build_prompt, max_tokens, temp, top_k)
-        except PoolBusy as e:
-            raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, f'{e}, try again shortly') from e
+            return self.pool.resolve(model)
         except (KeyError, ValueError, FileNotFoundError) as e:
             raise RequestError(HTTPStatus.NOT_FOUND, registry.message(e)) from e
+
+    def _submit[J: Job](self, job: J) -> J:
+        try:
+            self.pool.submit(job)
+        except PoolBusy as e:
+            raise RequestError(HTTPStatus.SERVICE_UNAVAILABLE, f'{e}, try again shortly') from e
+        except WrongModelKind as e:
+            raise RequestError(HTTPStatus.BAD_REQUEST, str(e)) from e
+        return job
 
     def _post_chat(self) -> None:
         payload = self._read_json()
@@ -265,7 +331,8 @@ class _Handler(BaseHTTPRequestHandler):
         created = int(time.time())
         started = time.perf_counter()
 
-        job = self._submit(model_name, lambda model: model.build_prompt(system, turns), max_tokens, temp, top_k)
+        sampling = {'max_tokens': max_tokens, 'temp': temp, 'top_k': top_k}
+        job = self._submit(TextGeneration(self._target(model_name), lambda model: model.build_prompt(system, turns), sampling))
         try:
             name = job.wait_ready()
             if not stream:
@@ -297,7 +364,8 @@ class _Handler(BaseHTTPRequestHandler):
         top_k = _as_int(payload, 'top_k')
         started = time.perf_counter()
 
-        job = self._submit(payload.get('model') or None, lambda _: prompt, max_tokens, temp, top_k)
+        sampling = {'max_tokens': max_tokens, 'temp': temp, 'top_k': top_k}
+        job = self._submit(TextGeneration(self._target(payload.get('model') or None), lambda _: prompt, sampling))
         try:
             name = job.wait_ready()
             if not stream:
@@ -317,11 +385,63 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             job.close()
 
+    def _post_images(self) -> None:
+        """OpenAI images/generations. Non-streamed: {data: [{b64_json}]}. Streamed: one image_generation.progress
+        event per denoising step, then an image_generation.completed event per image carrying its b64_json."""
+        payload = self._read_json()
+        prompt = payload.get('prompt')
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RequestError(HTTPStatus.BAD_REQUEST, 'prompt must be a non-empty string')
+        request = _image_request(payload)
+        fmt = _image_format(payload)
+        stream = bool(payload.get('stream', False))
+        created = int(time.time())
+        started = time.perf_counter()
+
+        job = self._submit(ImageGeneration(self._target(payload.get('model') or None), prompt, request))
+        try:
+            name = job.wait_ready()
+            if not stream:
+                data = [_image_item(index, pixels, fmt) for index, pixels in job.images()]
+                self._send_json({'created': created, 'model': name, 'data': data})
+                self._log_images(name, data, started)
+                return
+            self._sse_open()
+            data = []
+            for kind, event in job.events():
+                if kind == 'progress':
+                    index, done, total = event
+                    self._sse_write(json.dumps({'type': 'image_generation.progress', 'index': index, 'step': done, 'total': total}))
+                elif kind == 'image':
+                    item = _image_item(*event, fmt)
+                    data.append(item)
+                    self._sse_write(json.dumps({'type': 'image_generation.completed', 'created_at': created, 'model': name, **item}))
+            self._sse_write('[DONE]')
+            self._sse_close()
+            self._log_images(name, data, started)
+        finally:
+            job.close()
+
+    def _log_images(self, model: str, data: list[dict[str, Any]], started: float) -> None:
+        elapsed = time.perf_counter() - started
+        sizes = ', '.join(item['size'] for item in data)
+        console.print(f'[dim]POST /v1/images/generations {model} - {len(data)} image(s) [{sizes}] in {elapsed:.1f}s[/dim]')
+
     def _log(self, what: str, model: str, count: int, started: float, streamed: bool) -> None:
         elapsed = time.perf_counter() - started
         unit = 'tok' if streamed else 'chars'
         rate = f', {count / elapsed:.2f} {unit}/s' if elapsed > 0 and count else ''
         console.print(f'[dim]{what} {model} - {count} {unit} in {elapsed:.3f}s{rate}[/dim]')
+
+
+def _image_item(index: int, pixels: Tensor, fmt: str) -> dict[str, Any]:
+    _, height, width = pixels.shape
+    return {
+        'index': index,
+        'b64_json': base64.b64encode(encode_image(pixels, fmt)).decode('ascii'),
+        'output_format': 'jpeg' if fmt == 'jpg' else fmt,
+        'size': f'{width}x{height}',
+    }
 
 
 def _chunk(completion_id: str, created: int, model: str, delta: dict[str, str], finish_reason: str | None = None) -> dict[str, Any]:
@@ -358,7 +478,7 @@ def serve(pool: ModelPool, config: ServerConfig) -> None:
     handler = type('MagnetronHandler', (_Handler,), {'pool': pool, 'config': config})
     httpd = _Server((config.host, config.port), handler)
     console.print(f'[bold green]Listening[/] on http://{config.host}:{config.port}')
-    console.print('[dim]POST /v1/chat/completions | POST /api/generate | GET /v1/models | GET /health[/dim]')
+    console.print('[dim]POST /v1/chat/completions | POST /v1/images/generations | POST /api/generate | GET /v1/models | GET /health[/dim]')
     if pool.default_model is not None:
         console.print(f'[dim]Default model: {pool.default_model}[/dim]')
     try:

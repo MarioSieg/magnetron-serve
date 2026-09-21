@@ -13,8 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from magnetron_models.inference import DTYPES
-from magnetron_models.models import MODELS_MAP, ModelSpec
+from magnetron_models.models import DIFFUSION_MODELS_MAP, MODELS_MAP, DiffusionModelSpec, ModelSpec, is_pipeline_snapshot
 from magnetron_models.utils import download_or_ensure_resource, find_snapshot_file
+
+CHAT = 'chat'
+IMAGE = 'image'
+
+Spec = ModelSpec | DiffusionModelSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,9 +33,10 @@ class CachedSnapshot:
 @dataclass(frozen=True, slots=True)
 class Target:
     name: str
-    spec: ModelSpec | None = None
+    spec: Spec | None = None
     repo_id: str | None = None
     snapshot: str | None = None
+    kind: str | None = None  # CHAT or IMAGE; None for a bare Hub repo, whose snapshot says once it is on disk
 
     @property
     def is_local_file(self) -> bool:
@@ -45,18 +51,37 @@ def dtype_suffix(dtype: str) -> str:
     return DTYPES[dtype].short_name
 
 
+def snapshot_kind(path: str) -> str:
+    """A merged diffusion pipeline holds several networks under 'components'; anything else is a causal LM."""
+    from magnetron.snapshot import deserialize
+
+    _, metadata = deserialize(path)
+    return IMAGE if is_pipeline_snapshot(metadata) else CHAT
+
+
+def kind_of(target: Target, snapshot: str) -> str:
+    return target.kind if target.kind is not None else snapshot_kind(snapshot)
+
+
+def known_names() -> str:
+    return ', '.join(sorted([*MODELS_MAP, *DIFFUSION_MODELS_MAP]))
+
+
 def resolve(name: str) -> Target:
     if name.endswith('.mag'):
         path = Path(name).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f'No such snapshot: {path}')
-        return Target(name=path.stem, snapshot=str(path))
+        return Target(name=path.stem, snapshot=str(path), kind=snapshot_kind(str(path)))
     if name in MODELS_MAP:
         spec = MODELS_MAP[name]
-        return Target(name=name, spec=spec, repo_id=spec.snapshot_repo_id)
+        return Target(name=name, spec=spec, repo_id=spec.snapshot_repo_id, kind=CHAT)
+    if name in DIFFUSION_MODELS_MAP:
+        image_spec = DIFFUSION_MODELS_MAP[name]
+        return Target(name=name, spec=image_spec, repo_id=image_spec.snapshot_repo_id, kind=IMAGE)
     if '/' in name:
         return Target(name=name, repo_id=name)
-    raise KeyError(f'Unknown model {name!r}. Known names: {", ".join(sorted(MODELS_MAP))}. Or pass a Hub repo id or a .mag path.')
+    raise KeyError(f'Unknown model {name!r}. Known names: {known_names()}. Or pass a Hub repo id or a .mag path.')
 
 
 def cached_snapshots(repo_id: str | None = None) -> list[CachedSnapshot]:
@@ -87,6 +112,13 @@ def _pick(candidates: list[CachedSnapshot], dtype: str) -> CachedSnapshot | None
     return matching[0] if len(matching) == 1 else None
 
 
+def _spec_filename(spec: Spec, dtype: str) -> str | None:
+    """The one file a spec pins, if it pins one: a diffusion spec always names its file, an LM spec may."""
+    if isinstance(spec, DiffusionModelSpec):
+        return spec.snapshot_file(dtype_suffix(dtype))
+    return spec.snapshot_file
+
+
 def installed(target: Target, dtype: str = 'bfloat16') -> CachedSnapshot | None:
     if target.snapshot is not None:
         path = Path(target.snapshot)
@@ -94,8 +126,10 @@ def installed(target: Target, dtype: str = 'bfloat16') -> CachedSnapshot | None:
     if target.repo_id is None:
         return None
     candidates = cached_snapshots(target.repo_id)
-    if target.spec is not None and target.spec.snapshot_file is not None:
-        candidates = [c for c in candidates if c.filename == target.spec.snapshot_file]
+    if target.spec is not None:
+        pinned = _spec_filename(target.spec, dtype)
+        if pinned is not None:
+            candidates = [c for c in candidates if c.filename == pinned]
     return _pick(candidates, dtype)
 
 
@@ -125,10 +159,14 @@ def uninstall(target: Target) -> int:
     return freed
 
 
-def catalog(dtype: str = 'bfloat16') -> list[tuple[str, ModelSpec, CachedSnapshot | None]]:
-    return [(name, spec, installed(resolve(name), dtype)) for name, spec in sorted(MODELS_MAP.items())]
+def catalog(dtype: str = 'bfloat16') -> list[tuple[Target, CachedSnapshot | None]]:
+    out: list[tuple[Target, CachedSnapshot | None]] = []
+    for name in sorted([*MODELS_MAP, *DIFFUSION_MODELS_MAP]):
+        target = resolve(name)
+        out.append((target, installed(target, dtype)))
+    return out
 
 
 def strays() -> list[CachedSnapshot]:
-    known = {spec.snapshot_repo_id for spec in MODELS_MAP.values()}
+    known = {spec.snapshot_repo_id for spec in MODELS_MAP.values()} | {spec.snapshot_repo_id for spec in DIFFUSION_MODELS_MAP.values()}
     return [s for s in cached_snapshots() if s.repo_id not in known]

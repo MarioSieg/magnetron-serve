@@ -12,6 +12,7 @@ dependencies = [
     "huggingface-hub>=1.20.1",
     "magnetron-models>=0.1.0",
     "rich>=15.0.0",
+    "ruff>=0.16.8",
 ]
 
 [tool.uv.sources]
